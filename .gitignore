@@ -1,0 +1,25 @@
+.zig-cache/
+zig-out/
+zlm
+dist/
+
+models_gguf/
+models/
+*.gguf
+*.gguf.*
+
+.zlm/
+*.log
+*.pid
+*.sock
+
+# local OpenCode/zlm server config (use `zlm http config` or the docs example)
+config.json
+
+.idea/
+.vscode/
+*.swp
+*.swo
+*.kate-swp
+*~
+.DS_Store

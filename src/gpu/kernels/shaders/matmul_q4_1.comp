@@ -1,0 +1,106 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputMat {
+    float x[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightMat {
+    uint data[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputMat {
+    float y[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_tokens;          // M
+    uint num_rows;            // N (output features)
+    uint num_blocks_per_row;  // K / 32
+} params;
+
+shared float tile_X[16][32];
+
+uint read_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = data[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = data[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+uint read_u8(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    return (data[word_idx] >> shift) & 0xFFu;
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15u) & 0x0001u;
+    uint e = (h >> 10u) & 0x001Fu;
+    uint m = h & 0x03FFu;
+    if (e == 0u) {
+        if (m == 0u) return (s != 0u) ? -0.0 : 0.0;
+        while ((m & 0x0400u) == 0u) {
+            m <<= 1u;
+            e -= 1u;
+        }
+        e += 1u;
+        m &= 0x03FFu;
+    }
+    uint f = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    return uintBitsToFloat(f);
+}
+
+float read_f16(uint byte_off) {
+    uint u16_val = read_u16(byte_off);
+    return f16_to_f32(u16_val);
+}
+
+void main() {
+    uint n = gl_GlobalInvocationID.x;
+    uint m = gl_GlobalInvocationID.y;
+    uint K = params.num_blocks_per_row * 32u;
+    float sum = 0.0;
+
+    for (uint b = 0u; b < params.num_blocks_per_row; ++b) {
+        // Stage activation row slice into local workgroup shared memory
+        uint m_idx = gl_WorkGroupID.y * 16u + gl_LocalInvocationID.y;
+        uint k_base = b * 32u;
+
+        if (m_idx < params.num_tokens) {
+            tile_X[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = (k_base + gl_LocalInvocationID.x < K) ? x[m_idx * K + k_base + gl_LocalInvocationID.x] : 0.0;
+            tile_X[gl_LocalInvocationID.y][16u + gl_LocalInvocationID.x] = (k_base + 16u + gl_LocalInvocationID.x < K) ? x[m_idx * K + k_base + 16u + gl_LocalInvocationID.x] : 0.0;
+        } else {
+            tile_X[gl_LocalInvocationID.y][gl_LocalInvocationID.x] = 0.0;
+            tile_X[gl_LocalInvocationID.y][16u + gl_LocalInvocationID.x] = 0.0;
+        }
+
+        barrier();
+
+        if (m < params.num_tokens && n < params.num_rows) {
+            uint row_byte_off = n * params.num_blocks_per_row * 20u;
+            uint block_byte_off = row_byte_off + b * 20u;
+            float d = read_f16(block_byte_off);
+            float min_val = read_f16(block_byte_off + 2u);
+            uint nibbles_byte_off = block_byte_off + 4u;
+
+            for (uint j = 0u; j < 16u; ++j) {
+                uint byte_val = read_u8(nibbles_byte_off + j);
+                float q0 = float(byte_val & 0x0Fu);
+                float q1 = float(byte_val >> 4u);
+                sum += (q0 * d + min_val) * tile_X[gl_LocalInvocationID.y][j] + (q1 * d + min_val) * tile_X[gl_LocalInvocationID.y][16u + j];
+            }
+        }
+
+        barrier();
+    }
+
+    if (m < params.num_tokens && n < params.num_rows) {
+        y[m * params.num_rows + n] = sum;
+    }
+}

@@ -1,0 +1,214 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputVec {
+    float x[];
+};
+
+layout(std430, binding = 1) readonly buffer GateMat {
+    uint data[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputVec {
+    float y[];
+};
+
+layout(std430, binding = 3) readonly buffer UpMat {
+    uint udata[];
+};
+
+layout(std430, binding = 4) readonly buffer DownMat {
+    uint ddata[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_rows;
+    uint num_blocks_per_row;
+    uint groups_x;
+    uint act;
+    uint ffn_rows;
+    uint down_blocks_per_row;
+    uint pad0;
+    uint pad1;
+} params;
+
+layout(constant_id = 0) const uint ROWS_PER_GROUP = 4;
+layout(constant_id = 1) const uint UNROLL = 1;
+layout(constant_id = 2) const uint REDUCTION = 0;
+
+const uint M_TILE = 2048;
+const uint MAX_OUT = 8192;
+shared float m_tile[M_TILE];
+shared float out_acc[MAX_OUT];
+
+// q4_1 block: 2 bytes f16 scale `d`, 2 bytes f16 min `m`, then 16 bytes of
+// nibbles (20 bytes/block). The value is `d * nibble + m`.
+
+uint g_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = data[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = data[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+uint u_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = udata[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = udata[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+uint d_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = ddata[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = ddata[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+uint g_word(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint a = data[word_idx];
+    uint b = data[word_idx + 1u];
+    uint hi = b << ((32u - shift) & 31u);
+    return (shift == 0u) ? a : ((a >> shift) | hi);
+}
+
+uint u_word(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint a = udata[word_idx];
+    uint b = udata[word_idx + 1u];
+    uint hi = b << ((32u - shift) & 31u);
+    return (shift == 0u) ? a : ((a >> shift) | hi);
+}
+
+uint d_word(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint a = ddata[word_idx];
+    uint b = ddata[word_idx + 1u];
+    uint hi = b << ((32u - shift) & 31u);
+    return (shift == 0u) ? a : ((a >> shift) | hi);
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15u) & 0x0001u;
+    uint e = (h >> 10u) & 0x001Fu;
+    uint m = h & 0x03FFu;
+    if (e == 0u) {
+        if (m == 0u) return (s != 0u) ? -0.0 : 0.0;
+        while ((m & 0x0400u) == 0u) {
+            m <<= 1u;
+            e -= 1u;
+        }
+        e += 1u;
+        m &= 0x03FFu;
+    }
+    uint f = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    return uintBitsToFloat(f);
+}
+
+float g_f16(uint byte_off) { return f16_to_f32(g_u16(byte_off)); }
+float u_f16(uint byte_off) { return f16_to_f32(u_u16(byte_off)); }
+float d_f16(uint byte_off) { return f16_to_f32(d_u16(byte_off)); }
+
+vec4 low_nibbles(uint w) {
+    return unpackUnorm4x8(w & 0x0F0F0F0Fu) * 255.0;
+}
+vec4 high_nibbles(uint w) {
+    return unpackUnorm4x8((w >> 4u) & 0x0F0F0F0Fu) * 255.0;
+}
+float sum4(vec4 v) {
+    return v.x + v.y + v.z + v.w;
+}
+
+float apply_act(float g, float u) {
+    if (params.act == 1u) {
+        float inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
+        return 0.5 * g * (1.0 + tanh(inner)) * u;
+    }
+    return (g / (1.0 + exp(-g))) * u;
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    uint nlanes = gl_WorkGroupSize.x;
+    uint nb = params.num_blocks_per_row;
+    uint ffn = params.ffn_rows;
+    uint dnb = params.down_blocks_per_row;
+    uint hidden = params.num_rows;
+
+    for (uint r = lane; r < hidden; r += nlanes) out_acc[r] = 0.0;
+    barrier();
+
+    for (uint j0 = 0u; j0 < ffn; j0 += M_TILE) {
+        uint tile = min(M_TILE, ffn - j0);
+
+        for (uint jj = lane; jj < tile; jj += nlanes) {
+            uint j = j0 + jj;
+            float g = 0.0;
+            float u = 0.0;
+            for (uint b = 0u; b < nb; ++b) {
+                uint o = j * nb * 20u + b * 20u;
+                float dg = g_f16(o);
+                float mg = g_f16(o + 2u);
+                float du = u_f16(o);
+                float mu = u_f16(o + 2u);
+                uint nbase = o + 4u;
+                uint xb = b * 32u;
+                for (uint q = 0u; q < 4u; ++q) {
+                    uint cb = q * 4u;
+                    vec4 xlo = vec4(x[xb + cb], x[xb + cb + 1u], x[xb + cb + 2u], x[xb + cb + 3u]);
+                    vec4 xhi = vec4(x[xb + 16u + cb], x[xb + 16u + cb + 1u], x[xb + 16u + cb + 2u], x[xb + 16u + cb + 3u]);
+                    float sx = sum4(xlo) + sum4(xhi);
+                    g += dg * (dot(low_nibbles(g_word(nbase + cb)), xlo) + dot(high_nibbles(g_word(nbase + cb)), xhi)) + mg * sx;
+                    u += du * (dot(low_nibbles(u_word(nbase + cb)), xlo) + dot(high_nibbles(u_word(nbase + cb)), xhi)) + mu * sx;
+                }
+            }
+            m_tile[jj] = apply_act(g, u);
+        }
+        barrier();
+
+        uint b0 = j0 / 32u;
+        uint b1 = min((j0 + tile) / 32u, dnb);
+        for (uint r = lane; r < hidden; r += nlanes) {
+            float acc = 0.0;
+            for (uint b = b0; b < b1; ++b) {
+                uint o = r * dnb * 20u + b * 20u;
+                float dd = d_f16(o);
+                float dm = d_f16(o + 2u);
+                uint nbase = o + 4u;
+                uint mloc = b * 32u - j0;
+                for (uint q = 0u; q < 4u; ++q) {
+                    uint cb = q * 4u;
+                    vec4 mlo = vec4(m_tile[mloc + cb], m_tile[mloc + cb + 1u], m_tile[mloc + cb + 2u], m_tile[mloc + cb + 3u]);
+                    vec4 mhi = vec4(m_tile[mloc + 16u + cb], m_tile[mloc + 16u + cb + 1u], m_tile[mloc + 16u + cb + 2u], m_tile[mloc + 16u + cb + 3u]);
+                    float sm = sum4(mlo) + sum4(mhi);
+                    acc += dd * (dot(low_nibbles(d_word(nbase + cb)), mlo) + dot(high_nibbles(d_word(nbase + cb)), mhi)) + dm * sm;
+                }
+            }
+            out_acc[r] += acc;
+        }
+        barrier();
+    }
+
+    for (uint r = lane; r < hidden; r += nlanes) y[r] = out_acc[r];
+}

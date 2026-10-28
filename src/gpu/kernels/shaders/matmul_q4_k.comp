@@ -1,0 +1,161 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Batched Q4_K GEMM using the GEMV's memory layout.
+//
+// Same rewrite as `matmul_q4_0.comp`: the old 16x16 tiled shader re-read and
+// re-dequantized the weight per token and staged a 16x256 activation tile with
+// two barriers per super-block; measured at ~1.2 GB/s. This version copies the
+// GEMV: a workgroup owns `R` rows, the lanes stride cooperatively over the 256
+// elements of each super-block (a warp reads consecutive nibbles -> coalesced),
+// and it holds `T` tokens in registers, reusing each dequantized element for
+// all of them. Partials are reduced across the lanes at the end.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputMat {
+    float x[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightMat {
+    uint data[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputMat {
+    float y[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_tokens;          // M
+    uint num_rows;            // N (output features)
+    uint num_blocks_per_row;  // K / 256 (q4_K super-blocks)
+} params;
+
+const uint R = 4u;    // output rows per workgroup
+const uint T = 4u;   // tokens per workgroup
+const uint WG = 64u;  // workgroup size (must match local_size_x)
+const uint BLOCK_ELEMS = 256u;
+const uint BLOCK_BYTES = 144u;
+
+shared float red[R * T][WG];
+
+uint read_u8(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    return (data[word_idx] >> shift) & 0xFFu;
+}
+
+uint read_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = data[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = data[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15u) & 0x0001u;
+    uint e = (h >> 10u) & 0x001Fu;
+    uint m = h & 0x03FFu;
+    if (e == 0u) {
+        if (m == 0u) return (s != 0u) ? -0.0 : 0.0;
+        while ((m & 0x0400u) == 0u) {
+            m <<= 1u;
+            e -= 1u;
+        }
+        e += 1u;
+        m &= 0x03FFu;
+    }
+    uint f = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    return uintBitsToFloat(f);
+}
+
+float read_f16(uint byte_off) {
+    return f16_to_f32(read_u16(byte_off));
+}
+
+// Packed 6-bit scale/min pair `is` (0..7), matching the CPU `getScaleMinK4`.
+void get_scale_min(uint is, uint block_off, out uint sc, out uint mn) {
+    uint sb = block_off + 4u;
+    if (is < 4u) {
+        sc = read_u8(sb + is) & 63u;
+        mn = read_u8(sb + is + 4u) & 63u;
+    } else {
+        sc = (read_u8(sb + is + 4u) & 0x0Fu) | ((read_u8(sb + is - 4u) >> 6u) << 4u);
+        mn = (read_u8(sb + is + 4u) >> 4u) | ((read_u8(sb + is) >> 6u) << 4u);
+    }
+}
+
+// One element of a q4_K super-block (256 values), matching `matvec_q4_k.comp`.
+float q4k_elem(uint block_off, uint e) {
+    uint g64 = e >> 6u;
+    uint p = e & 63u;
+    uint hi = p >> 5u;
+    uint is = g64 * 2u + hi;
+    uint qidx = g64 * 32u + (p & 31u);
+    uint byte_val = read_u8(block_off + 16u + qidx);
+    uint nib = (hi != 0u) ? (byte_val >> 4u) : (byte_val & 0x0Fu);
+    uint sc;
+    uint mn;
+    get_scale_min(is, block_off, sc, mn);
+    float d = read_f16(block_off);
+    float mnf = read_f16(block_off + 2u);
+    return float(nib) * (d * float(sc)) - mnf * float(mn);
+}
+
+void main() {
+    uint K = params.num_blocks_per_row * BLOCK_ELEMS;
+    uint nb = params.num_blocks_per_row;
+    uint base_row = gl_WorkGroupID.x * R;
+    uint base_tok = gl_WorkGroupID.y * T;
+    uint lane = gl_LocalInvocationID.x;
+
+    float acc[R * T];
+#pragma unroll
+    for (uint i = 0u; i < R * T; ++i) acc[i] = 0.0;
+
+    // All lanes cooperate on the same super-block, each owning the elements
+    // `lane, lane+WG, ...` (coalesced across a warp).
+    for (uint b = 0u; b < nb; ++b) {
+        uint x_base = b * BLOCK_ELEMS;
+        for (uint e = lane; e < BLOCK_ELEMS; e += WG) {
+            float w[R];
+#pragma unroll
+            for (uint r = 0u; r < R; ++r) {
+                uint row = base_row + r;
+                w[r] = (row < params.num_rows) ? q4k_elem(row * nb * BLOCK_BYTES + b * BLOCK_BYTES, e) : 0.0;
+            }
+#pragma unroll
+            for (uint t = 0u; t < T; ++t) {
+                uint m = base_tok + t;
+                if (m < params.num_tokens) {
+                    float xv = x[m * K + x_base + e];
+#pragma unroll
+                    for (uint r = 0u; r < R; ++r) acc[t * R + r] += w[r] * xv;
+                }
+            }
+        }
+    }
+
+    // Cross-lane reduction of the R*T partials (tree in shared memory). [A/B: tree]
+#pragma unroll
+    for (uint i = 0u; i < R * T; ++i) red[i][lane] = acc[i];
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+#pragma unroll
+            for (uint i = 0u; i < R * T; ++i) red[i][lane] += red[i][lane + s];
+        }
+        barrier();
+    }
+    if (lane < R * T) {
+        uint t = lane / R;
+        uint r = lane % R;
+        uint m = base_tok + t;
+        uint row = base_row + r;
+        if (m < params.num_tokens && row < params.num_rows) y[m * params.num_rows + row] = red[lane][0];
+    }
+}

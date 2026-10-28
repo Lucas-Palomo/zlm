@@ -1,0 +1,132 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputVec {
+    float x[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightMat {
+    uint data[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputVec {
+    float y[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_rows;
+    // One element per "block" for an unquantized weight; the row width `k`.
+    uint num_blocks_per_row;
+    uint groups_x;
+} params;
+
+// Specialization constants (the driver specializes one shader into N pipelines):
+//   constant_id 0 ROWS_PER_GROUP  the row tile per workgroup (4 or 8)
+//   constant_id 1 UNROLL          inner element unroll factor (the ILP lever)
+//   constant_id 2 REDUCTION       0 = shared-memory tree, 1 = subgroup/wave
+//   constant_id 3 WORKGROUP_SIZE  the local_size_x (the wavefront lanes)
+layout(constant_id = 0) const uint ROWS_PER_GROUP = 4;
+layout(constant_id = 1) const uint UNROLL = 1;
+layout(constant_id = 2) const uint REDUCTION = 0;
+
+const uint MAX_ROWS = 8;
+const uint MAX_LANES = 128;
+shared float red[MAX_ROWS][MAX_LANES];
+
+uint read_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = data[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = data[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15u) & 0x0001u;
+    uint e = (h >> 10u) & 0x001Fu;
+    uint m = h & 0x03FFu;
+    if (e == 0u) {
+        if (m == 0u) return (s != 0u) ? -0.0 : 0.0;
+        while ((m & 0x0400u) == 0u) {
+            m <<= 1u;
+            e -= 1u;
+        }
+        e += 1u;
+        m &= 0x03FFu;
+    }
+    uint f = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    return uintBitsToFloat(f);
+}
+
+void main() {
+    uint gid = gl_WorkGroupID.y * params.groups_x + gl_WorkGroupID.x;
+    uint base_row = gid * ROWS_PER_GROUP;
+    uint lane = gl_LocalInvocationID.x;
+    uint nb = params.num_blocks_per_row;
+    float acc[UNROLL][ROWS_PER_GROUP];
+#pragma unroll
+    for (uint u = 0u; u < UNROLL; ++u)
+#pragma unroll
+        for (uint r = 0u; r < ROWS_PER_GROUP; ++r) acc[u][r] = 0.0;
+
+    for (uint b0 = lane; b0 < nb; b0 += gl_WorkGroupSize.x * UNROLL) {
+        for (uint u = 0u; u < UNROLL; ++u) {
+            uint b = b0 + u * gl_WorkGroupSize.x;
+            if (b >= nb) break;
+            float xv = x[b];
+#pragma unroll
+            for (uint r = 0u; r < ROWS_PER_GROUP; ++r) {
+                uint row = base_row + r;
+                if (row < params.num_rows) acc[u][r] += f16_to_f32(read_u16((row * nb + b) * 2u)) * xv;
+            }
+        }
+    }
+
+    // Fold the unroll lanes into chain 0 before the cross-lane reduction.
+#pragma unroll
+    for (uint r = 0u; r < ROWS_PER_GROUP; ++r) {
+#pragma unroll
+        for (uint u = 1u; u < UNROLL; ++u) acc[0][r] += acc[u][r];
+    }
+
+    if (REDUCTION == 1u) {
+        for (uint r = 0u; r < ROWS_PER_GROUP; ++r) acc[0][r] = subgroupAdd(acc[0][r]);
+        if (gl_NumSubgroups > 1u) {
+            if (gl_SubgroupInvocationID == 0u) {
+                for (uint r = 0u; r < ROWS_PER_GROUP; ++r) red[r][gl_SubgroupID] = acc[0][r];
+            }
+            barrier();
+            if (gl_SubgroupID == 0u) {
+                for (uint r = 0u; r < ROWS_PER_GROUP; ++r) {
+                    float v = (gl_SubgroupInvocationID < gl_NumSubgroups) ? red[r][gl_SubgroupInvocationID] : 0.0;
+                    acc[0][r] = subgroupAdd(v);
+                }
+            }
+        }
+        if (gl_SubgroupID == 0u && gl_SubgroupInvocationID == 0u) {
+            for (uint r = 0u; r < ROWS_PER_GROUP; ++r) red[r][0] = acc[0][r];
+        }
+        barrier();
+    } else {
+#pragma unroll
+        for (uint r = 0u; r < ROWS_PER_GROUP; ++r) red[r][lane] = acc[0][r];
+        barrier();
+        for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1u) {
+            if (lane < s) {
+                for (uint r = 0u; r < ROWS_PER_GROUP; ++r) red[r][lane] += red[r][lane + s];
+            }
+            barrier();
+        }
+    }
+
+    if (lane < ROWS_PER_GROUP) {
+        uint row = base_row + lane;
+        if (row < params.num_rows) y[row] = red[lane][0];
+    }
+}

@@ -1,0 +1,157 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+// Batched Q4_0 GEMM using the GEMV's memory layout.
+//
+// The previous "one lane per output row" version had each lane stream a
+// *different* weight row (stride `num_blocks*18`), so a warp touched 32 far
+// apart addresses: uncoalesced. The calibration profile measured the GEMM at
+// ~2.1 GB/s against the GEMV's ~48 GB/s for exactly this reason.
+//
+// This version copies the GEMV's structure: a workgroup owns `R` output rows
+// and the lanes stride cooperatively over the k-blocks of those rows (so a warp
+// reads consecutive 18-byte blocks of the *same* rows -> coalesced). On top of
+// that it holds `T` tokens in registers and reuses each dequantized block for
+// all of them, so the weight is read `ceil(m/T)` times instead of `m`, and the
+// dequantization is paid once per (row, block) per workgroup. The partials are
+// reduced across the lanes at the end (a tree in shared memory, like the GEMV).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputMat {
+    float x[];
+};
+
+layout(std430, binding = 1) readonly buffer WeightMat {
+    uint data[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputMat {
+    float y[];
+};
+
+layout(push_constant) uniform PushConsts {
+    uint num_tokens;          // M
+    uint num_rows;            // N (output features)
+    uint num_blocks_per_row;  // K / 32
+} params;
+
+const uint R = 4u;   // output rows per workgroup
+const uint T = 4u;   // tokens per workgroup
+const uint WG = 64u; // workgroup size (must match local_size_x)
+
+shared float red[R * T][WG];
+
+uint read_u16(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint w0 = data[word_idx];
+    if (shift <= 16u) {
+        return (w0 >> shift) & 0xFFFFu;
+    } else {
+        uint w1 = data[word_idx + 1u];
+        return ((w0 >> 24u) | (w1 << 8u)) & 0xFFFFu;
+    }
+}
+
+uint read_word(uint byte_off) {
+    uint word_idx = byte_off >> 2u;
+    uint shift = (byte_off & 3u) * 8u;
+    uint a = data[word_idx];
+    uint b = data[word_idx + 1u];
+    uint hi = b << ((32u - shift) & 31u);
+    return (shift == 0u) ? a : ((a >> shift) | hi);
+}
+
+float f16_to_f32(uint h) {
+    uint s = (h >> 15u) & 0x0001u;
+    uint e = (h >> 10u) & 0x001Fu;
+    uint m = h & 0x03FFu;
+    if (e == 0u) {
+        if (m == 0u) return (s != 0u) ? -0.0 : 0.0;
+        while ((m & 0x0400u) == 0u) {
+            m <<= 1u;
+            e -= 1u;
+        }
+        e += 1u;
+        m &= 0x03FFu;
+    }
+    uint f = (s << 31u) | ((e + 112u) << 23u) | (m << 13u);
+    return uintBitsToFloat(f);
+}
+
+float read_f16(uint byte_off) {
+    return f16_to_f32(read_u16(byte_off));
+}
+
+vec4 low_nibbles(uint w) {
+    return unpackUnorm4x8(w & 0x0F0F0F0Fu) * 255.0 - 8.0;
+}
+vec4 high_nibbles(uint w) {
+    return unpackUnorm4x8((w >> 4u) & 0x0F0F0F0Fu) * 255.0 - 8.0;
+}
+
+void main() {
+    uint K = params.num_blocks_per_row * 32u;
+    uint nb = params.num_blocks_per_row;
+    uint base_row = gl_WorkGroupID.x * R;
+    uint base_tok = gl_WorkGroupID.y * T;
+    uint lane = gl_LocalInvocationID.x;
+
+    float acc[R * T];
+#pragma unroll
+    for (uint i = 0u; i < R * T; ++i) acc[i] = 0.0;
+
+    // Lanes stride over the k-blocks (the GEMV's cooperative pattern): a warp
+    // reads consecutive blocks of the same R rows.
+    for (uint b = lane; b < nb; b += WG) {
+        uint x_base = b * 32u;
+        float d[R];
+        uint o[R];
+#pragma unroll
+        for (uint r = 0u; r < R; ++r) {
+            uint row = base_row + r;
+            bool valid = row < params.num_rows;
+            o[r] = valid ? row * nb * 18u + b * 18u : 0u;
+            d[r] = valid ? read_f16(o[r]) : 0.0;
+        }
+#pragma unroll
+        for (uint g = 0u; g < 4u; ++g) {
+            uint cb = g * 4u;
+            uint w[R];
+#pragma unroll
+            for (uint r = 0u; r < R; ++r) w[r] = read_word(o[r] + 2u + cb);
+#pragma unroll
+            for (uint t = 0u; t < T; ++t) {
+                uint m = base_tok + t;
+                if (m < params.num_tokens) {
+                    uint xb = m * K + x_base + cb;
+                    vec4 xlo = vec4(x[xb], x[xb + 1u], x[xb + 2u], x[xb + 3u]);
+                    vec4 xhi = vec4(x[xb + 16u], x[xb + 17u], x[xb + 18u], x[xb + 19u]);
+#pragma unroll
+                    for (uint r = 0u; r < R; ++r) {
+                        acc[t * R + r] += d[r] * (dot(low_nibbles(w[r]), xlo) + dot(high_nibbles(w[r]), xhi));
+                    }
+                }
+            }
+        }
+    }
+
+    // Cross-lane reduction of the R*T partials (tree in shared memory). [A/B: tree]
+#pragma unroll
+    for (uint i = 0u; i < R * T; ++i) red[i][lane] = acc[i];
+    barrier();
+    for (uint s = WG / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+#pragma unroll
+            for (uint i = 0u; i < R * T; ++i) red[i][lane] += red[i][lane + s];
+        }
+        barrier();
+    }
+    if (lane < R * T) {
+        uint t = lane / R;
+        uint r = lane % R;
+        uint m = base_tok + t;
+        uint row = base_row + r;
+        if (m < params.num_tokens && row < params.num_rows) y[m * params.num_rows + row] = red[lane][0];
+    }
+}

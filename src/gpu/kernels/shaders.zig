@@ -1,0 +1,19 @@
+pub const matvec_q4_0_spv align(4) = @embedFile("shaders/matvec_q4_0.spv").*;
+pub const matvec_q4_1_spv align(4) = @embedFile("shaders/matvec_q4_1.spv").*;
+pub const matvec_q8_0_spv align(4) = @embedFile("shaders/matvec_q8_0.spv").*;
+pub const matvec_q6_k_spv align(4) = @embedFile("shaders/matvec_q6_k.spv").*;
+pub const matvec_gate_up_q4_0_spv align(4) = @embedFile("shaders/matvec_gate_up_q4_0.spv").*;
+pub const matvec_gate_up_q4_1_spv align(4) = @embedFile("shaders/matvec_gate_up_q4_1.spv").*;
+pub const matvec_gate_up_q8_0_spv align(4) = @embedFile("shaders/matvec_gate_up_q8_0.spv").*;
+pub const matvec_mlp_q4_0_spv align(4) = @embedFile("shaders/matvec_mlp_q4_0.spv").*;
+pub const matvec_mlp_q4_1_spv align(4) = @embedFile("shaders/matvec_mlp_q4_1.spv").*;
+pub const matvec_mlp_q8_0_spv align(4) = @embedFile("shaders/matvec_mlp_q8_0.spv").*;
+pub const matvec_q4_k_spv align(4) = @embedFile("shaders/matvec_q4_k.spv").*;
+pub const matvec_f32_spv align(4) = @embedFile("shaders/matvec_f32.spv").*;
+pub const matvec_f16_spv align(4) = @embedFile("shaders/matvec_f16.spv").*;
+pub const matvec_bf16_spv align(4) = @embedFile("shaders/matvec_bf16.spv").*;
+
+pub const matmul_q4_0_spv align(4) = @embedFile("shaders/matmul_q4_0.spv").*;
+pub const matmul_q4_1_spv align(4) = @embedFile("shaders/matmul_q4_1.spv").*;
+pub const matmul_q8_0_spv align(4) = @embedFile("shaders/matmul_q8_0.spv").*;
+pub const matmul_q4_k_spv align(4) = @embedFile("shaders/matmul_q4_k.spv").*;

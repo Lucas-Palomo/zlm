@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+      - name: Test
+        run: zig build test
+      - name: Build static Linux binary
+        run: zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseFast -Dcpu=x86_64_v2
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp zig-out/bin/zlm dist/
+          cp LICENSE README.md dist/
+          tar -czf "zlm-${GITHUB_REF_NAME}-x86_64-linux-musl.tar.gz" -C dist .
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zlm-*-x86_64-linux-musl.tar.gz

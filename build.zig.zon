@@ -1,0 +1,14 @@
+.{
+    .name = .zlm,
+    .version = "0.1.0",
+    .fingerprint = 0x5c6c0ddab5585837,
+    .minimum_zig_version = "0.16.0",
+    .description = "You decide how your language model runs",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
